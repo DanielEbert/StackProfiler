@@ -21,6 +21,7 @@ from flask_cors import CORS
 from flask import request
 import threading
 
+MAX_STACKTRACE_DEPTH = 40
 
 BUFFER_SIZE = 1024
 SERVER_PORT = 7155
@@ -98,7 +99,7 @@ def get_plot(reports: list[StackReport]) -> str:
         data = []
     
     tooltips = []
-    for tooltip_name in ['index', 'stackDepth', 'time', 'pc', 'sp']:
+    for tooltip_name in ['index', 'stackDepth', 'time', 'stack_size']:
         tooltips.append({'field': tooltip_name, 'type': 'quantitative'})
     tooltips.append({'field': 'func_name', 'type': 'nominal'})
 
@@ -130,7 +131,7 @@ def remove_duplicate_reports(reports: list[StackReport]) -> list[StackReport]:
 
     def get_stack_hash(s: dict[int, StackReport]) -> int:
         ret = []
-        for i in range(30):
+        for i in range(MAX_STACKTRACE_DEPTH):
             if i in stack:
                 ret.extend([stack[i].stackDepth, stack[i].pc, stack[i].sp])
         return hash(tuple(ret))
@@ -139,7 +140,9 @@ def remove_duplicate_reports(reports: list[StackReport]) -> list[StackReport]:
 
     for i in range(1, len(reports)):
         if reports[i].stackDepth < prev_report.stackDepth:
-            del stack[prev_report.stackDepth]
+            for i in range(reports[i].stack_size + 1, MAX_STACKTRACE_DEPTH):
+                if i in stack:
+                    del stack[i]
         stack[reports[i].stackDepth] = reports[i]
     
         stackhash = get_stack_hash(stack)
