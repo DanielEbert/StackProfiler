@@ -14,10 +14,17 @@ import functools
 from dataclasses import dataclass
 import dataclasses
 import json
+from collections import defaultdict
+
+from flask import Flask
+from flask_cors import CORS
+from flask import request
+import threading
 
 
 BUFFER_SIZE = 1024
 SERVER_PORT = 7155
+API_PORT = 7166
 
 class Addr2Line:
     def __init__(self, prog_path: str) -> None:
@@ -80,12 +87,20 @@ def pretty_print_ms(ms: int) -> str:
 
 
 def get_plot(reports: list[StackReport]) -> str:
-    # note that stackpointer grows downwards
-    max_sp = max([r.sp for r in reports])
-    for r in reports:
-        r.stack_size = max_sp - r.sp
+    if reports:
+        # note that stackpointer grows downwards
+        max_sp = max([r.sp for r in reports])
+        for r in reports:
+            r.stack_size = max_sp - r.sp
 
-    data = [dataclasses.asdict(r) for r in reports]
+        data = [dataclasses.asdict(r) for r in reports]
+    else:
+        data = []
+    
+    tooltips = []
+    for tooltip_name in ['index', 'stackDepth', 'time', 'pc', 'sp']:
+        tooltips.append({'field': tooltip_name, 'type': 'quantitative'})
+    tooltips.append({'field': 'func_name', 'type': 'nominal'})
 
     return json.dumps({
         "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
@@ -95,9 +110,44 @@ def get_plot(reports: list[StackReport]) -> str:
         "mark": "bar",
         "encoding": {
             "x": {"field": "index", "type": "nominal"},
-            "y": {"field": "stack_size", "type": "quantitative"}
-        }
+            "y": {"field": "stack_size", "type": "quantitative"},
+            "tooltip": tooltips,
+        },
+        "width": 1200,
+        "height": 800
     })
+
+
+def remove_duplicate_reports(reports: list[StackReport]) -> list[StackReport]:
+    if not reports:
+        return []
+
+    ret = [reports[0]]
+
+    prev_report = reports[0]
+    stack: dict[int, StackReport] = defaultdict(int)
+    stack[prev_report.stackDepth] = prev_report
+
+    def get_stack_hash(s: dict[int, StackReport]) -> int:
+        ret = []
+        for i in range(30):
+            if i in stack:
+                ret.extend([stack[i].stackDepth, stack[i].pc, stack[i].sp])
+        return hash(tuple(ret))
+
+    previous_stackhashes: set[int] = set([get_stack_hash(stack)])
+
+    for i in range(1, len(reports)):
+        if reports[i].stackDepth < prev_report.stackDepth:
+            del stack[prev_report.stackDepth]
+        stack[reports[i].stackDepth] = reports[i]
+    
+        stackhash = get_stack_hash(stack)
+        if stackhash not in previous_stackhashes:
+            previous_stackhashes.add(stackhash)
+            ret.append(reports[i])
+
+    return ret
 
 
 # TODO: use argparse later
@@ -105,6 +155,7 @@ if len(sys.argv) < 2:
     raise Exception('Missing argument to target executable. ./main.py path/to/target')
 
 prog = Program(sys.argv[1])
+reports: list[StackReport] = []
 
 def main() -> NoReturn:
     new_cov_queue: mp.Queue[int] = mp.Queue()
@@ -112,9 +163,9 @@ def main() -> NoReturn:
     cov_receiver_proc = mp.Process(target=new_cov_receiver, args=(new_cov_queue,))
     cov_receiver_proc.start()
 
-    last_cov_receive_time = time.time()
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=API_PORT, debug=True, use_reloader=False)).start()
 
-    reports: list[StackReport] = []
+    last_cov_receive_time = time.time()
 
     while True:
         try:
@@ -122,10 +173,6 @@ def main() -> NoReturn:
             func_name = prog.function_addr_to_str(pc)
             reports.append(StackReport(len(reports) + 1, stackDepth, timestamp, func_name, pc, sp))
             print(f'[{stackDepth}]: {pretty_print_ms(timestamp)} {func_name=}, {pc=}, {sp=}')
-
-            # TODO: do on http request
-            with open('spec.json', 'w') as f:
-                f.write(get_plot(reports))
         except queue.Empty:
             pass
 
@@ -149,6 +196,37 @@ def new_cov_receiver(new_cov_queue: mp.Queue[tuple[int, str, int]]) -> None:
         sp = struct.unpack('Q', message[20:28])[0]
 
         new_cov_queue.put((stackDepth, timestamp, pc, sp))
+
+
+API_PORT = 7166
+
+app = Flask(__name__)
+CORS(app)
+
+
+@app.route('/getPlot')
+def getCoveredLines():
+    unique_reports = remove_duplicate_reports(reports)
+
+    plot_json = get_plot(unique_reports)
+    return f"""\
+<!doctype html>
+<html>
+  <head>
+    <title>Stack Profile</title>
+    <script src="https://cdn.jsdelivr.net/npm/vega@5.25.0"></script>
+    <script src="https://cdn.jsdelivr.net/npm/vega-lite@5.16.3"></script>
+    <script src="https://cdn.jsdelivr.net/npm/vega-embed@6.22.2"></script>
+  </head>
+  <body>
+    <div id="vis"></div>
+    <script type="text/javascript">
+      var yourVlSpec = {plot_json}
+      vegaEmbed('#vis', yourVlSpec);
+    </script>
+  </body>
+</html>
+"""
 
 
 if __name__ == '__main__':
